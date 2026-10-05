@@ -30,6 +30,7 @@ def client():
     conn.executescript(
         "DELETE FROM endpoint_leases;"
         "DELETE FROM delivery_attempts;"
+        "DELETE FROM domain_claim_limits;"
         "DELETE FROM draft_rules;"
         "DELETE FROM delivery_policy;"
         "DELETE FROM delivery_decisions;"

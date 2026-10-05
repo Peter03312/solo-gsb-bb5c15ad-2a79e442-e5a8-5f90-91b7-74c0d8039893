@@ -1,4 +1,4 @@
-"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定（单笔与批量）、投递回执（按终点 + 序号回传实际结果与汇总查询）、投递任务领取（到期 / 退避入列 + 租约，凭令牌原子回执）、历史判定核对报表与灰度自动熔断。"""
+"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、默认投递策略、幂等投递判定（单笔与批量）、投递回执（按终点 + 序号回传实际结果与汇总查询）、投递任务领取（到期 / 退避入列 + 租约 + 按终点邮箱域名的在途领取上限，凭令牌原子回执）、历史判定核对报表与灰度自动熔断。"""
 from __future__ import annotations
 
 import sqlite3
@@ -13,6 +13,7 @@ from .models import (
     DeliveryBatchSubmit,
     DeliveryReceiptIn,
     DeliverySubmit,
+    DomainClaimLimitIn,
     DraftChangesRequest,
     DraftUpdate,
     LeaseCompleteIn,
@@ -716,6 +717,94 @@ def delivery_report(
     }
 
 
+# ---------- 按终点邮箱域名的在途领取上限（管理员设置 / 删除 / 查询） ----------
+
+def _domain_limit_doc(row: dict) -> dict:
+    return {"domain": row["domain"], "max_claims": row["max_claims"], "updated_at": row["updated_at"]}
+
+
+@app.get("/deliveries/claim-limits")
+def list_domain_claim_limits() -> dict:
+    """列出全部已配置的终点邮箱域名在途领取上限（按域名升序）；未配置时为空列表。"""
+    with db.read_transaction() as conn:
+        rows = store.list_domain_claim_limits(conn)
+    return {"limits": [_domain_limit_doc(r) for r in rows]}
+
+
+@app.get("/deliveries/claim-limits/{domain}")
+def get_domain_claim_limit(domain: str) -> dict:
+    """查询某个终点邮箱域名的在途领取数上限（域名大小写归一）。
+
+    非法域名 → 422 invalid_domain；未配置该域 → 404 domain_claim_limit_not_found
+    （未配置域不受限）。
+    """
+    try:
+        normalized = store.normalize_domain(domain)
+    except store.InvalidClaimDomain:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_domain", "domain": domain,
+                    "message": f"invalid domain: {domain!r}"},
+        )
+    with db.read_transaction() as conn:
+        row = store.get_domain_claim_limit(conn, normalized)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "domain_claim_limit_not_found", "domain": normalized,
+                    "message": f"no in-flight claim limit configured for {normalized}"},
+        )
+    return _domain_limit_doc(row)
+
+
+@app.put("/deliveries/claim-limits/{domain}")
+def put_domain_claim_limit(domain: str, body: DomainClaimLimitIn) -> dict:
+    """设置（或覆盖）某终点邮箱域名的同时在途领取数上限（正整数）。
+
+    域名大小写归一（去空白、转小写）；非法域名或非正上限（请求体层 422）一律
+    拒绝且配置不变。未配置域不受限；上限对后续领取立即生效——调低不撤销已发
+    令牌，但该域占用降到新上限以下前不再领取新任务。核对与领取在单个
+    BEGIN IMMEDIATE 事务内原子完成，并发配置变更与领取串行化、不超额。
+    """
+    try:
+        normalized = store.normalize_domain(domain)
+    except store.InvalidClaimDomain:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_domain", "domain": domain,
+                    "message": f"invalid domain: {domain!r}"},
+        )
+    try:
+        with db.transaction() as conn:
+            row = store.put_domain_claim_limit(conn, normalized, body.max_claims)
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return _domain_limit_doc(row)
+
+
+@app.delete("/deliveries/claim-limits/{domain}")
+def delete_domain_claim_limit(domain: str) -> dict:
+    """删除某终点邮箱域名的在途领取上限（幂等：未配置也返回 200）。
+
+    域名大小写归一；非法域名 → 422 invalid_domain 且配置不变。删除后该域不再
+    受限（已发出的租约令牌不受影响）。
+    """
+    try:
+        normalized = store.normalize_domain(domain)
+    except store.InvalidClaimDomain:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_domain", "domain": domain,
+                    "message": f"invalid domain: {domain!r}"},
+        )
+    try:
+        with db.transaction() as conn:
+            store.delete_domain_claim_limit(conn, normalized)
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return {"domain": normalized, "deleted": True}
+
+
 @app.get("/deliveries/{delivery_id}")
 def get_delivery(delivery_id: str) -> dict:
     """查询已持久化的投递判定（含失败判定与原错误详情）；未知编号返回 404。"""
@@ -851,10 +940,15 @@ def claim_delivery_tasks(body: TaskClaimIn) -> dict:
     时刻与租约令牌。入列规则：无回执立即到期；最新回执为 temporary_failure 时
     于该回执时间后按 min(60×2^(尝试序号−1), 3600) 秒到期；最新回执为
     delivered / permanent_failure 不再入列。
+    此外按终点邮箱域名执行管理员配置的同时在途领取上限：满额域的任务被跳过、
+    继续领取其他域；未配置域不受限。只有未完成、未过期且未被更新回执取代的
+    租约占用名额。
 
-    核对与领取在单个 BEGIN IMMEDIATE 事务内完成：并发领取不会重复分配有效
-    租约；到期终点可被重新领取，重领即轮换令牌（旧令牌立即失效）。
-    暂无到期项返回空列表（200）；参数越界由请求体校验拒绝（422）。
+    核对与领取在单个 BEGIN IMMEDIATE 事务内完成（配置变更同样取该写锁）：
+    并发领取不会重复分配有效租约，任一域名也不会超额；到期终点可被重新领取，
+    重领即轮换令牌（旧令牌立即失效）。
+    暂无到期项（或到期项所在域全部满额）返回空列表（200）；参数越界由请求体
+    校验拒绝（422）。
     """
     try:
         with db.transaction() as conn:

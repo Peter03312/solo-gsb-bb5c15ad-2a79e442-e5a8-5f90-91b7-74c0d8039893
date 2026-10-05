@@ -119,6 +119,17 @@ class LeaseCompleteIn(BaseModel):
     result: Literal["temporary_failure", "permanent_failure", "delivered"]
 
 
+class DomainClaimLimitIn(BaseModel):
+    """管理员设置某终点邮箱域名的同时在途领取数上限（正整数）。
+
+    域名取自路径（大小写归一在路由层完成）；body 中可选回传域名仅为兼容自描述
+    请求体，不作为权威值。
+    """
+
+    max_claims: int = Field(ge=1, description="该域同时在途领取数上限（正整数）")
+    domain: str | None = Field(default=None, description="可选回显域名；权威值取自路径")
+
+
 class ValidationFailure(Exception):
     """编辑期校验失败，message 直接作为 4xx 响应。"""
 

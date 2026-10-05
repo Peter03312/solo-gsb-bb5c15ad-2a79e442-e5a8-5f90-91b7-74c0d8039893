@@ -1,4 +1,4 @@
-"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约与灰度熔断。"""
+"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约、按终点邮箱域名的在途领取上限与灰度熔断。"""
 from __future__ import annotations
 
 import os
@@ -117,6 +117,16 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
     PRIMARY KEY (delivery_id, mailbox, attempt_no)
 );
 
+-- 按终点邮箱域名的同时在途领取数上限：管理员可设置 / 删除 / 查询。
+-- 域名为规范化小写；未配置的域名不受限。占用名额的只是“未完成、未到期且未被
+-- 更新回执取代”的有效租约（领取事务内按当时 limits 与占用数原子核对，不超额）。
+-- 调低上限不撤销已发令牌：占用降到新上限以下前不再领取该域的新任务。
+CREATE TABLE IF NOT EXISTS domain_claim_limits (
+    domain     TEXT PRIMARY KEY,                  -- 终点邮箱域名（规范化小写）
+    max_claims INTEGER NOT NULL CHECK (max_claims >= 1),  -- 该域同时在途领取数上限（正整数）
+    updated_at TEXT NOT NULL
+);
+
 -- 投递任务租约：投递系统按 (投递编号, 终点) 领取可执行的投递任务。
 -- 仅已持久化的“成功”判定中的终点可入列：无回执立即到期；最新回执为 temporary_failure
 -- 时按 min(60×2^(尝试序号−1), 3600) 秒退避到期；最新回执为 delivered / permanent_failure
@@ -143,6 +153,10 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(config.DB_PATH, isolation_level=None)  # 自动提交，事务显式控制
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 供按终点邮箱域名统计在途租约占用：domain_of('a@b.example.com') = 'b.example.com'
+    from .routing import domain_of as _domain_of
+
+    conn.create_function("domain_of", 1, _domain_of, deterministic=True)
     return conn
 
 

@@ -27,6 +27,7 @@ def _reset():
         "DELETE FROM draft_rules;"
         "DELETE FROM delivery_policy;"
         "DELETE FROM delivery_attempts;"
+        "DELETE FROM domain_claim_limits;"
         "DELETE FROM delivery_decisions;"
         "DELETE FROM circuit_breaker_settings;"
         "DELETE FROM circuit_breaks;"

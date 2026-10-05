@@ -90,6 +90,16 @@
   未知的令牌一律 **409 `invalid_lease_token`**（附 `reason`：`expired` / `completed` /
   `superseded` / `unknown`）；参数越界 422；暂无到期项返回空列表。写入的回执与既有回执
   接口写入的是同一张表，既有回执查询、判定查询 / 重放、核对报表与熔断统计的约定完全不变。
+- **按终点邮箱域名的在途领取上限**：管理员用 `PUT /deliveries/claim-limits/{domain}` 设置
+  **正整数上限**，`DELETE` 删除（幂等），`GET /deliveries/claim-limits` 与
+  `GET /deliveries/claim-limits/{domain}` 查询；**域名大小写归一**（去空白、转小写），
+  非法域名或非正上限一律拒绝（422）且**配置不变**，**未配置域不受限**。
+  领取仍按既有**到期顺序与请求上限**进行：某域满额时**跳过该域任务、继续领取其他域**；
+  只有**未完成、未过期且未被更新回执取代**的租约占用名额——租约完成、到期或被既有回执
+  接口抢先写入（`superseded`）后立即释放。**调低上限不撤销已发令牌**，但占用降到新上限
+  以下前不再领取该域新任务；调高 / 删除上限对后续领取立即生效。域名上限的读取、占用核对
+  与租约写入与并发领取 / 配置变更同在单个 `BEGIN IMMEDIATE` 事务内，**绝不超额**；
+  既有回执、令牌完成、判定查询 / 重放、核对报表与熔断统计的响应约定保持不变。
 
 ## 一键启动（Docker Compose）
 
@@ -150,8 +160,12 @@ pytest tests/ -q                                   # 运行测试
 | GET  | `/deliveries/report` | 历史判定核对报表：时间窗 + 分组计数 + 游标分页     |
 | POST | `/deliveries/{id}/receipts` | 投递结果回执：按终点 + 正整数序号回传实际投递结果 |
 | GET  | `/deliveries/{id}/receipts` | 查询各终点尝试记录（按序号升序）与汇总状态         |
-| POST | `/deliveries/claims`        | 投递任务领取：按到期时刻/编号/终点排序领取终点任务并设租约 |
+| POST | `/deliveries/claims`        | 投递任务领取：按到期时刻/编号/终点排序领取终点任务并设租约（受域名在途上限约束） |
 | POST | `/deliveries/claims/{token}/complete` | 凭有效租约令牌提交回执，原子写入并结束租约   |
+| GET  | `/deliveries/claim-limits` | 列出全部终点邮箱域名的在途领取上限            |
+| GET  | `/deliveries/claim-limits/{domain}` | 查询某域名的在途领取上限（未配置 404） |
+| PUT  | `/deliveries/claim-limits/{domain}` | 设置 / 覆盖某域名的正整数在途领取上限     |
+| DELETE | `/deliveries/claim-limits/{domain}` | 删除某域名的在途领取上限（幂等）       |
 | GET  | `/deliveries/{id}` | 按投递编号查询已持久化的判定（含失败） |
 
 ## 调用示例
@@ -984,6 +998,108 @@ while true; do
 done
 ```
 
+## 按终点邮箱域名限制同时在途领取数
+
+某些终点邮箱提供方要求“同一域同时在投递 / 在重试的任务不得超过 N 个”。管理员可按
+**终点邮箱域名**（即判定终点 `mailbox` 的 `@` 之后部分，不是收件入口地址的域）配置
+正整数上限；领取服务在既有“到期排序 + 请求上限”之上再按域核对，满额域跳过、继续其他域。
+
+### 23. 设置 / 查询 / 删除域名上限
+
+**设置或覆盖**——`PUT /deliveries/claim-limits/{domain}`，请求体只需正整数 `max_claims`：
+
+```bash
+curl -X PUT http://localhost:8000/deliveries/claim-limits/mail.example.com \
+  -H 'Content-Type: application/json' -d '{"max_claims": 2}'
+```
+
+```json
+{"domain": "mail.example.com", "max_claims": 2, "updated_at": "2026-10-05T09:00:00+00:00"}
+```
+
+- **域名大小写归一**：路径中的域名去空白、转小写后存储与比较，
+  `PUT .../MAIL.Example.COM` 与 `.../mail.example.com` 是同一份配置（响应始终回小写域）。
+- **非法域名 → `422 {"error": "invalid_domain", ...}`，非正上限（`0` / 负数，请求体层）→
+  `422`；两种情况都拒绝且配置不变**（已有上限保持原值）。
+- **查询单个域**：`GET /deliveries/claim-limits/mail.example.com` 返回与 PUT 相同的形状；
+  **未配置的域 → `404 {"error": "domain_claim_limit_not_found", "domain": ...}`**
+  （未配置即“不受限”，不是错误状态）。
+- **列出全部配置**（按域名升序）：
+
+  ```bash
+  curl http://localhost:8000/deliveries/claim-limits
+  # => {"limits": [{"domain": "mail.example.com", "max_claims": 2, "updated_at": "..."}]}
+  ```
+
+- **删除上限**（幂等；删除未配置的域同样返回 200）：
+
+  ```bash
+  curl -X DELETE http://localhost:8000/deliveries/claim-limits/mail.example.com
+  # => {"domain": "mail.example.com", "deleted": true}
+  ```
+
+  删除后该域**不再受限**；已发出的租约令牌不受任何配置变更影响。
+
+### 24. 领取时按域跳过：满额域不挡其他域
+
+假设已有任务 `alice@mail.example.com`、`bob@mail.example.com`（同一域）与
+`dana@other.example.net`（另一域，未配置上限），先把 `mail.example.com` 限为 1：
+
+```bash
+curl -X PUT http://localhost:8000/deliveries/claim-limits/mail.example.com \
+  -H 'Content-Type: application/json' -d '{"max_claims": 1}'
+
+curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: application/json' \
+  -d '{"max_claims": 10, "lease_seconds": 300}'
+```
+
+按**到期时刻 → 投递编号 → 终点**的既有顺序核对：`alice`（mail 域）被领取、占用达到 1 后，
+同域的 `bob`（以及任何其他 `mail.example.com` 终点）**被跳过**；未配置上限的
+`other.example.net` 不受影响，`dana` 照常领取——**满额域不会挡住其他域，被跳过的任务也
+不消耗请求的 `max_claims`**：
+
+```json
+{"tasks": [
+  {"delivery_id": "msg-1", "mailbox": "alice@mail.example.com", "attempt_no": 1, "...": "..."},
+  {"delivery_id": "msg-9", "mailbox": "dana@other.example.net", "attempt_no": 1, "...": "..."}
+]}
+```
+
+紧接着再次领取时，mail 域仍满额、other 域也没有剩余到期项 → `{"tasks": []}`。
+**未配置任何上限时，领取行为与本轮功能上线前完全一致。**
+
+### 25. 名额何时释放 / 上限调整何时生效
+
+占用名额的租约必须同时满足：**未完成**（未凭令牌回执）、**未过期**
+（`lease_expires_at` 未到）、且**未被更新回执取代**。因此：
+
+- 凭令牌完成回执（`POST /deliveries/claims/{token}/complete`，任何结果）→
+  租约结束，名额立即释放（`delivered` / `permanent_failure` 终结不再入列；
+  `temporary_failure` 退避到期后可再领）。
+- 租约**到期**未回执 → 不再占名额，该终点可被重新领取（旧令牌立即失效）。
+- 既有回执接口（`POST /deliveries/{id}/receipts`）**抢先写入**了不早于租约序号的新回执 →
+  该租约进入 `superseded` 状态，令牌之后提交得 `409 superseded`，而**名额即刻释放**
+  （同一终点按最新回执重新排定后可被再次领取）。
+
+上限调整的语义：
+
+- **调低不撤销已发令牌**：例如上限从 3 调到 1 时，已发的 3 个租约令牌都仍然有效；
+  但在该域占用降到 1 以下之前，服务**不再领取**该域的任何新任务（其他域照常）。
+- **调高 / 删除上限**对**后续**领取立即生效（不影响已发令牌，也不补发）。
+- 配置变更与领取都走同一个 `BEGIN IMMEDIATE` 写锁：并发领取与并发“设置 / 删除上限”
+  被串行化，每笔领取在同一事务快照内读取上限与当前占用后逐项核对、写租约，
+  **任何时刻任一域名的有效在途租约都不会超过其当时的配置上限**。
+
+### 26. 与既有功能的边界
+
+- 域名上限只影响 `POST /deliveries/claims` 的挑选过程；既有回执接口
+  `POST /deliveries/{id}/receipts`、凭令牌完成的请求 / 响应（含
+  `expired` / `completed` / `superseded` / `unknown` 四种 409）、
+  `GET /deliveries/{id}` 判定查询与同编号原样重放、`GET /deliveries/report`
+  核对报表、灰度熔断统计（只数判定行）的**请求与响应形状全部不变**。
+- 旧版本程序生成的数据库首次启动时自动创建 `domain_claim_limits` 表，无需手工迁移；
+  空表等价于“所有域均未配置、不受限”。
+
 ## 项目结构
 
 ```
@@ -994,9 +1110,9 @@ app/
   traffic.py   # 默认投递的稳定分桶：规范化地址 → 0–99 桶 → 基线/候选
   preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
   reporting.py # 核对报表：带时区时间窗（左闭右开）校验、页大小校验、翻页游标编解码
-  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组/投递回执/任务领取）
-  store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约、核对报表与灰度熔断的持久化与查询
-  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/batch、/deliveries/report、/deliveries/{id}/receipts、/deliveries/claims 等）
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 批量投递判定 + 投递回执 + 任务领取与租约 + 按键合并与修订快照 + 核对报表 + 灰度自动熔断
+  models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组/投递回执/任务领取/域名在途上限）
+  store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约、终点域名在途领取上限、核对报表与灰度熔断的持久化与查询
+  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/batch、/deliveries/report、/deliveries/{id}/receipts、/deliveries/claims、/deliveries/claim-limits 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 批量投递判定 + 投递回执 + 任务领取与租约 + 按域名在途领取上限 + 按键合并与修订快照 + 核对报表 + 灰度自动熔断
 Dockerfile / docker-compose.yml
 ```
