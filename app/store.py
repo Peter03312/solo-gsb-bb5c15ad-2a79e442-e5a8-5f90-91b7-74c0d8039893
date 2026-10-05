@@ -1,4 +1,4 @@
-"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定、投递回执（按终点 + 序号回传实际结果与汇总）、投递任务租约（到期 / 退避入列、领取与令牌回执）、历史判定核对报表与灰度自动熔断。"""
+"""持久层：草稿（带乐观锁修订号、按键合并与修订快照）、不可变发布版本、默认投递策略（基线/候选灰度）、幂等投递判定、投递回执（按终点 + 序号回传实际结果与汇总）、投递任务租约（到期 / 退避入列、领取与令牌回执、按终点邮箱域名限制同时在途领取数）、历史判定核对报表与灰度自动熔断。"""
 from __future__ import annotations
 
 import json
@@ -6,7 +6,7 @@ import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from .routing import Rule, RuleSet, Target
+from .routing import Rule, RuleSet, Target, domain_of
 
 
 class RevisionConflict(Exception):
@@ -955,12 +955,50 @@ def claim_due_tasks(
     # 到期时刻 → 投递编号 → 终点，稳定排序
     candidates.sort(key=lambda item: (item[0], item[1], item[2]))
 
+    # 管理员配置的终点域名在途上限（未配置的域名不受限）与各域名当前占用。
+    # 占用只数“未完成、未到期且未被更新回执抢先取代”的租约：与上面的候选扫描在
+    # 同一 BEGIN IMMEDIATE 事务 / 同一时间点上计算，配合本事务持有的写锁，
+    # 并发领取与配置变更都被串行化，核对到的占用即提交时的占用，绝不超额。
+    limits = {
+        row["domain"]: row["max_in_flight"]
+        for row in conn.execute("SELECT domain, max_in_flight FROM domain_claim_limits")
+    }
+    in_flight: dict[str, int] = {}
+    if limits:
+        occupancy_rows = conn.execute(
+            """
+            SELECT substr(l.mailbox, instr(l.mailbox, '@') + 1) AS domain, COUNT(*) AS n
+            FROM endpoint_leases l
+            WHERE l.completed_at IS NULL
+              AND l.lease_expires_at > ?
+              AND NOT EXISTS (
+                    SELECT 1 FROM delivery_attempts a
+                    WHERE a.delivery_id = l.delivery_id
+                      AND a.mailbox = l.mailbox
+                      AND a.attempt_no >= l.attempt_no
+              )
+            GROUP BY domain
+            """,
+            (now_text,),
+        ).fetchall()
+        in_flight = {row["domain"]: row["n"] for row in occupancy_rows}
+
     lease_expires_at = current + timedelta(seconds=lease_seconds)
     leased_at_text = now_text
     expires_text = lease_expires_at.isoformat(timespec="seconds")
 
+    # 按到期顺序依次领取：某域名已满额（事务开始时占用 + 本事务已领 >= 上限）时跳过
+    # 其任务，继续领取后面其他域名的到期任务，直到凑满 max_claims 或候选耗尽。
+    # 调低上限不撤销已发出的令牌：已超额的域名在占用降到新上限以下前一项都不再领取。
     tasks: list[dict] = []
-    for due_at, delivery_id, mailbox, next_attempt_no in candidates[:max_claims]:
+    claimed_per_domain: dict[str, int] = {}
+    for due_at, delivery_id, mailbox, next_attempt_no in candidates:
+        if len(tasks) >= max_claims:
+            break
+        domain = domain_of(mailbox)
+        limit = limits.get(domain)
+        if limit is not None and in_flight.get(domain, 0) + claimed_per_domain.get(domain, 0) >= limit:
+            continue
         token = secrets.token_hex(16)
         # 每个 (投递编号, 终点) 至多一行：到期重领 / 已结束终点再次到期时整体轮换
         # 该行——新令牌、新到期时刻并复位完成标记，旧令牌立即失效。attempt_no 取
@@ -992,6 +1030,7 @@ def claim_due_tasks(
                 "token": token,
             }
         )
+        claimed_per_domain[domain] = claimed_per_domain.get(domain, 0) + 1
     return tasks
 
 
@@ -1051,3 +1090,65 @@ def complete_lease(
         "result": result,
         "created_at": created_at,
     }
+
+
+# ---------- 终点邮箱域名的同时在途领取数上限（管理员配置） ----------
+#
+# 按终点邮箱域名（归一为小写）配置正整数上限；未配置的域名不受限。
+# 上限只在领取（claim_due_tasks）时于同一 BEGIN IMMEDIATE 事务内核对：
+# 占用仅统计“未完成、未到期且未被更新回执抢先取代”的有效租约，
+# 因此租约完成、到期或被既有回执接口抢先写入后即释放名额。
+# 配置写入与领取都经 BEGIN IMMEDIATE 串行化，核对与提交原子完成，绝不超额；
+# 调低上限不撤销已发出的令牌，只在占用降到新上限以下前暂停该域名的新领取。
+# 配置表与判定 / 回执 / 熔断完全解耦，既有接口的请求与响应形状不受影响。
+
+def _domain_limit_doc(domain: str, max_in_flight: int, updated_at: str) -> dict:
+    return {"domain": domain, "max_in_flight": max_in_flight, "updated_at": updated_at}
+
+
+def list_domain_claim_limits(conn: sqlite3.Connection) -> list[dict]:
+    """列出全部已配置的终点域名在途上限，按域名升序。须在事务内调用。"""
+    rows = conn.execute(
+        "SELECT domain, max_in_flight, updated_at FROM domain_claim_limits ORDER BY domain"
+    ).fetchall()
+    return [_domain_limit_doc(r["domain"], r["max_in_flight"], r["updated_at"]) for r in rows]
+
+
+def get_domain_claim_limit(conn: sqlite3.Connection, domain: str) -> dict | None:
+    """读取某域名的在途上限配置；未配置返回 None。域名须已由调用方归一与校验。"""
+    row = conn.execute(
+        "SELECT domain, max_in_flight, updated_at FROM domain_claim_limits WHERE domain = ?",
+        (domain,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _domain_limit_doc(row["domain"], row["max_in_flight"], row["updated_at"])
+
+
+def set_domain_claim_limit(conn: sqlite3.Connection, domain: str, max_in_flight: int) -> dict:
+    """设置（或覆盖）某终点域名的同时在途领取数上限。须在 BEGIN IMMEDIATE 事务内调用。
+
+    upsert 语义：已存在则整体替换上限（占用立即按新上限核对；调低不撤销已发令牌）。
+    域名合法性、大小写归一与正整数校验由调用方在入事务前完成。
+    """
+    updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT INTO domain_claim_limits (domain, max_in_flight, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(domain) DO UPDATE SET
+            max_in_flight = excluded.max_in_flight,
+            updated_at = excluded.updated_at
+        """,
+        (domain, max_in_flight, updated_at),
+    )
+    return _domain_limit_doc(domain, max_in_flight, updated_at)
+
+
+def delete_domain_claim_limit(conn: sqlite3.Connection, domain: str) -> bool:
+    """删除某终点域名的在途上限配置（删除后该域名不受限）。须在写事务内调用。
+
+    幂等：删除已存在配置返回 True；本来就未配置也不报错，返回 False。
+    """
+    cur = conn.execute("DELETE FROM domain_claim_limits WHERE domain = ?", (domain,))
+    return cur.rowcount > 0

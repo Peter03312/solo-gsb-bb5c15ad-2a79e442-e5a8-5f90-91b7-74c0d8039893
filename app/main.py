@@ -13,6 +13,7 @@ from .models import (
     DeliveryBatchSubmit,
     DeliveryReceiptIn,
     DeliverySubmit,
+    DomainClaimLimitIn,
     DraftChangesRequest,
     DraftUpdate,
     LeaseCompleteIn,
@@ -25,7 +26,7 @@ from .models import (
     normalize_changes,
     normalize_rules,
 )
-from .routing import ResolutionError, RuleSet, is_valid_address, resolve, validate_ruleset
+from .routing import ResolutionError, RuleSet, is_valid_address, is_valid_domain, resolve, validate_ruleset
 from .traffic import select_version
 
 
@@ -854,6 +855,9 @@ def claim_delivery_tasks(body: TaskClaimIn) -> dict:
 
     核对与领取在单个 BEGIN IMMEDIATE 事务内完成：并发领取不会重复分配有效
     租约；到期终点可被重新领取，重领即轮换令牌（旧令牌立即失效）。
+    管理员为终点邮箱域名配置的同时在途领取数上限同样在该事务内原子核对：
+    某域名在途占用（未完成、未到期且未被更新回执抢先取代的租约）已满时跳过
+    其到期任务、继续领取其他域名；未配置域名不受限。
     暂无到期项返回空列表（200）；参数越界由请求体校验拒绝（422）。
     """
     try:
@@ -895,3 +899,77 @@ def complete_delivery_claim(token: str, body: LeaseCompleteIn) -> dict:
     except sqlite3.OperationalError as exc:  # 并发写冲突
         raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
     return attempt
+
+
+# ---------- 终点邮箱域名的同时在途领取数上限（管理员配置 / 删除 / 查询） ----------
+
+def _normalize_limit_domain(raw: str) -> str:
+    """域名配置键归一：去空白、转小写；非法域名按 422 拒绝（配置不变）。"""
+    domain = raw.strip().lower()
+    if not is_valid_domain(domain):
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_domain", "domain": raw,
+                    "message": f"invalid endpoint domain: {raw!r}"},
+        )
+    return domain
+
+
+@app.get("/deliveries/claims/domain-limits")
+def list_domain_limits() -> dict:
+    """列出全部终点邮箱域名的同时在途领取数上限（按域名升序）；从未配置时为空列表。"""
+    with db.read_transaction() as conn:
+        limits = store.list_domain_claim_limits(conn)
+    return {"limits": limits}
+
+
+@app.put("/deliveries/claims/domain-limits")
+def put_domain_limit(body: DomainClaimLimitIn) -> dict:
+    """设置（或覆盖）某终点邮箱域名的同时在途领取数上限（正整数）。
+
+    域名去空白后大小写归一（MAIL.Example.com 与 mail.example.com 同一项）；
+    非法域名或非正整数上限一律 422 拒绝且不改动任何既有配置。
+    写入在单个 BEGIN IMMEDIATE 事务内完成，与并发领取串行化：领取事务看到的
+    上限与其在途占用核对必然来自同一时点，不会超额。调低上限不撤销已发出的
+    租约令牌，该域名在在途占用降到新上限以下前不再领取新任务；
+    调高或新设上限立即对后续领取生效。
+    """
+    domain = _normalize_limit_domain(body.domain)
+    try:
+        with db.transaction() as conn:
+            limit = store.set_domain_claim_limit(conn, domain, body.max_in_flight)
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return limit
+
+
+@app.get("/deliveries/claims/domain-limits/{domain}")
+def get_domain_limit(domain: str) -> dict:
+    """查询单个终点邮箱域名的在途上限；非法域名 422，未配置域名 404。"""
+    normalized = _normalize_limit_domain(domain)
+    with db.read_transaction() as conn:
+        limit = store.get_domain_claim_limit(conn, normalized)
+    if limit is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": "domain_limit_not_found", "domain": normalized,
+                    "message": f"no in-flight claim limit configured for {normalized}"},
+        )
+    return limit
+
+
+@app.delete("/deliveries/claims/domain-limits/{domain}")
+def delete_domain_limit(domain: str) -> dict:
+    """删除某终点邮箱域名的在途上限（删除后该域名不受限）。
+
+    非法域名 422；幂等——删除已存在配置与删除一个本就未配置的域名都返回 200，
+    仅以 deleted 区分本次是否实际删除。核对与删除在单个 BEGIN IMMEDIATE 事务内
+    完成，与并发领取串行化。
+    """
+    normalized = _normalize_limit_domain(domain)
+    try:
+        with db.transaction() as conn:
+            deleted = store.delete_domain_claim_limit(conn, normalized)
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return {"domain": normalized, "deleted": deleted, "max_in_flight": None}

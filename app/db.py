@@ -1,4 +1,4 @@
-"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约与灰度熔断。"""
+"""SQLite 存储层：草稿（修订号 + 修订快照）、不可变发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约、终点域名在途领取上限与灰度熔断。"""
 from __future__ import annotations
 
 import os
@@ -135,6 +135,17 @@ CREATE TABLE IF NOT EXISTS endpoint_leases (
     completed_at     TEXT,                            -- 凭有效令牌提交回执的时刻；NULL=未结束
     result           TEXT CHECK (result IN ('temporary_failure', 'permanent_failure', 'delivered')),
     UNIQUE (delivery_id, mailbox)
+);
+
+-- 终点邮箱域名的同时在途领取数上限（管理员配置，按域名一行；未配置的域名不受限）。
+-- 域名统一小写归一；max_in_flight 为正整数。仅“未完成、未到期且未被更新回执
+-- （delivery_attempts 中存在序号 >= 租约序号的记录）抢先取代”的租约占用该域名名额。
+-- 领取与配置变更都在单个 BEGIN IMMEDIATE 事务内核对并写入，互斥串行化，绝不超额；
+-- 调低上限不撤销已发出的令牌，只在在途占用降到新上限以下前暂停该域名的新领取。
+CREATE TABLE IF NOT EXISTS domain_claim_limits (
+    domain        TEXT PRIMARY KEY,                  -- 终点邮箱域名（规范化小写）
+    max_in_flight INTEGER NOT NULL CHECK (max_in_flight >= 1),  -- 同时在途领取数的正整数上限
+    updated_at    TEXT NOT NULL
 );
 """
 

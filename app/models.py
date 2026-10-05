@@ -119,6 +119,13 @@ class LeaseCompleteIn(BaseModel):
     result: Literal["temporary_failure", "permanent_failure", "delivered"]
 
 
+class DomainClaimLimitIn(BaseModel):
+    """管理员设置终点邮箱域名的同时在途领取数上限（正整数）。域名大小写归一、去空白后须为合法域名。"""
+
+    domain: str
+    max_in_flight: int = Field(ge=1, description="该域名同时在途领取数的正整数上限")
+
+
 class ValidationFailure(Exception):
     """编辑期校验失败，message 直接作为 4xx 响应。"""
 

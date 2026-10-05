@@ -90,6 +90,16 @@
   未知的令牌一律 **409 `invalid_lease_token`**（附 `reason`：`expired` / `completed` /
   `superseded` / `unknown`）；参数越界 422；暂无到期项返回空列表。写入的回执与既有回执
   接口写入的是同一张表，既有回执查询、判定查询 / 重放、核对报表与熔断统计的约定完全不变。
+- **按终点邮箱域名限制同时在途领取数**：管理员可设置（`PUT`）、删除（`DELETE`）并查询
+  （`GET` 单项 / 列表）**终点邮箱域名的正整数在途上限**；域名**去空白、大小写归一**
+  （`MAIL.Example.com` 与 `mail.example.com` 同一项），非法域名或非正上限一律 **422 拒绝
+  且既有配置不变**，**未配置的域名不受限**。领取仍按既有“到期时刻 → 投递编号 → 终点”顺序
+  与请求上限进行：某域名在途占用已满时**跳过其到期任务、继续领取其他域名**。占用只统计
+  **未完成、未到期且未被更新回执抢先取代**的租约——租约**完成、到期或被既有回执接口抢先
+  写入后立即释放名额**。**调低上限不撤销已发出的令牌**：该域名占用降到新上限以下前不再
+  发放新任务；调高 / 新设 / 删除上限立即对后续领取生效。领取与配置变更都在单个
+  `BEGIN IMMEDIATE` 事务内原子核对，并发下绝不超额；既有回执、令牌完成、判定与报表接口
+  的请求 / 响应形状保持不变。
 
 ## 一键启动（Docker Compose）
 
@@ -152,6 +162,10 @@ pytest tests/ -q                                   # 运行测试
 | GET  | `/deliveries/{id}/receipts` | 查询各终点尝试记录（按序号升序）与汇总状态         |
 | POST | `/deliveries/claims`        | 投递任务领取：按到期时刻/编号/终点排序领取终点任务并设租约 |
 | POST | `/deliveries/claims/{token}/complete` | 凭有效租约令牌提交回执，原子写入并结束租约   |
+| GET  | `/deliveries/claims/domain-limits` | 列出全部终点邮箱域名的同时在途领取数上限   |
+| PUT  | `/deliveries/claims/domain-limits` | 设置 / 覆盖某终点域名的正整数在途上限（域名大小写归一） |
+| GET  | `/deliveries/claims/domain-limits/{domain}` | 查询单个域名的在途上限（未配置 404）   |
+| DELETE | `/deliveries/claims/domain-limits/{domain}` | 删除某域名的在途上限（幂等，删除后该域名不受限） |
 | GET  | `/deliveries/{id}` | 按投递编号查询已持久化的判定（含失败） |
 
 ## 调用示例
@@ -900,6 +914,8 @@ curl -X POST http://localhost:8000/deliveries/claims -H 'Content-Type: applicati
   租约有效期内该终点不会再被分配给任何人。
 - `token`：租约令牌（32 位十六进制），完成回执时使用。
 - **暂无到期项** → `200 {"tasks": []}`；`max_claims` 或 `lease_seconds` 越界 / 缺失 → `422`。
+- 若管理员为**终点邮箱域名**配置了同时在途领取数上限，满额域名的任务会被跳过、继续领取
+  其他域名（详见下文章节 23–24）；未配置域名不受影响。
 
 **入列与退避规则（按每个“投递编号 × 终点”独立计算，依据该终点最新一条回执）**：
 
@@ -984,6 +1000,93 @@ while true; do
 done
 ```
 
+## 按终点邮箱域名限制同时在途领取数
+
+为避免某个接收域（如某家邮件服务商）被同时打太多发信连接，管理员可以按**终点邮箱的域名**
+配置“**同时在途领取数**”（未结束、未到期、未被更新回执取代的租约数）上限。未配置的域名
+不受限；上限只影响“领取”这一步，**不影响判定、回执、报表与已发出的令牌**。
+
+### 23. 域名在途上限：设置 / 查询 / 删除
+
+**设置或覆盖**（`PUT /deliveries/claims/domain-limits`）：请求体给出域名与正整数上限。
+域名自动**去空白、转小写**，因此 `MAIL.Example.com` 与 `mail.example.com` 是同一项；
+非法域名（不是合法域名字面量）或非正整数上限一律 `422 invalid_domain` / 请求体校验拒绝，
+**任何既有配置都不改变**。
+
+```bash
+# mail.example.com 最多同时在途 2 个领取任务
+curl -X PUT http://localhost:8000/deliveries/claims/domain-limits \
+  -H 'Content-Type: application/json' \
+  -d '{"domain": "mail.example.com", "max_in_flight": 2}'
+```
+
+```json
+{"domain": "mail.example.com", "max_in_flight": 2, "updated_at": "2026-10-05T09:02:11+00:00"}
+```
+
+**查询单项**：`GET /deliveries/claims/domain-limits/mail.example.com`（域名同样大小写归一；
+非法域名 `422`，**未配置返回 `404 domain_limit_not_found`**）。
+
+**列出全部**（按域名升序；从未配置时为空列表）：
+
+```bash
+curl http://localhost:8000/deliveries/claims/domain-limits
+```
+
+```json
+{"limits": [
+  {"domain": "mail.example.com", "max_in_flight": 2, "updated_at": "2026-10-05T09:02:11+00:00"}
+]}
+```
+
+**删除**（删除后该域名恢复不受限；接口幂等，删除未配置项也返回 `200`，以 `deleted` 区分）：
+
+```bash
+curl -X DELETE http://localhost:8000/deliveries/claims/domain-limits/mail.example.com
+```
+
+```json
+{"domain": "mail.example.com", "deleted": true, "max_in_flight": null}
+```
+
+### 24. 上限如何作用于领取
+
+- 领取仍完全遵循第 19 节的**入列 / 退避规则与“到期时刻 → 投递编号 → 终点”排序**，
+  `max_claims` 仍是本次返回的总上限。差别只是在按顺序发放时，逐个核对该任务终点域名的
+  在途占用：**已满额的域名 → 跳过这一项，继续往后领取其他域名**，直到凑满 `max_claims`
+  或候选耗尽。未配置上限的域名永远不跳过。
+- **占用名额的租约**必须同时满足：`completed_at IS NULL`（未凭令牌完成）、
+  `lease_expires_at > 当前时刻`（未到期）、且 `delivery_attempts` 中尚不存在
+  序号 ≥ 租约序号的回执（未被既有回执接口抢先取代）。
+- **名额在下列时刻立即释放**（无需任何额外操作，下次领取即可见）：
+  1. 凭令牌 `POST /deliveries/claims/{token}/complete` 成功写入回执（租约结束）；
+  2. 到达 `lease_expires_at` 仍未回执（租约到期，该终点可被重新领取）；
+  3. 投递系统绕过租约、直接经 `POST /deliveries/{id}/receipts` 先写入了不早于租约序号的
+     新回执（旧令牌随即变为 `superseded`，不再占用名额）。
+- **调低上限不撤销已发出的令牌**：例如上限从 3 调到 1 时已经有 2 个在途，这 2 个令牌依然
+  有效、可正常完成；只是占用降到 1 以下之前，该域名不再发放任何新任务。
+  **调高、新设或删除上限立即对后续领取生效**。
+- **原子性**：领取的“扫描占用 + 核对上限 + 写租约”与配置的“写上限”都在单个
+  `BEGIN IMMEDIATE` 事务内完成，由 SQLite 写锁互相串行化：并发的多次领取与并发的配置
+  变更无论怎样交错，任一域名在任一时刻的在途租约都不会超过其当时生效的上限。
+- 域名上限只读取 `domain_claim_limits` 并统计 `endpoint_leases`，**不触碰判定、回执、
+  策略、报表与熔断表**；既有接口的请求 / 响应形状、错误码与重放 / 汇总语义完全不变。
+
+举例：`mail.example.com` 上限为 1，队列中按到期顺序有
+`msg-a → alice@mail.example.com`、`msg-a → bob@mail.example.com`、
+`msg-b → carol@mail.example.com`、`msg-c → dave@other.example.net`（其他域，未配置上限），
+则一次领取（`max_claims=10`）返回 `alice` 与 `dave`——`bob`、`carol` 因同域已满被跳过：
+
+```json
+{"tasks": [
+  {"delivery_id": "msg-a", "mailbox": "alice@mail.example.com", "attempt_no": 1, "...": "..."},
+  {"delivery_id": "msg-c", "mailbox": "dave@other.example.net", "attempt_no": 1, "...": "..."}
+]}
+```
+
+`alice` 的令牌被完成（或其租约到期 / 被直接回执抢先）后再次领取，才会按到期顺序发出
+该域名的下一个任务（上例中为 `bob`）。
+
 ## 项目结构
 
 ```
@@ -995,8 +1098,8 @@ app/
   preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
   reporting.py # 核对报表：带时区时间窗（左闭右开）校验、页大小校验、翻页游标编解码
   models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标/按键合并操作组/投递回执/任务领取）
-  store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约、核对报表与灰度熔断的持久化与查询
-  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/batch、/deliveries/report、/deliveries/{id}/receipts、/deliveries/claims 等）
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 批量投递判定 + 投递回执 + 任务领取与租约 + 按键合并与修订快照 + 核对报表 + 灰度自动熔断
+  store.py     # 草稿、修订快照、发布版本、默认投递策略、幂等投递判定、投递回执、投递任务租约（含按终点域名的在途领取上限）、核对报表与灰度熔断的持久化与查询
+  main.py      # FastAPI 路由（/draft、/draft/changes、/resolve、/preview、/policy、/policy/circuit-breaker、/deliver、/deliveries、/deliveries/batch、/deliveries/report、/deliveries/{id}/receipts、/deliveries/claims、/deliveries/claims/domain-limits 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略 + 幂等投递判定 + 批量投递判定 + 投递回执 + 任务领取与租约 + 终点域名在途上限 + 按键合并与修订快照 + 核对报表 + 灰度自动熔断
 Dockerfile / docker-compose.yml
 ```
